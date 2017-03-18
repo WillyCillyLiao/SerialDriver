@@ -1,0 +1,1507 @@
+ /* 
+ * This file is part of the Nautilus AeroKernel developed
+ * by the Hobbes and V3VEE Projects with funding from the 
+ * United States National  Science Foundation and the Department of Energy.  
+ *
+ * The V3VEE Project is a joint project between Northwestern University
+ * and the University of New Mexico.  The Hobbes Project is a collaboration
+ * led by Sandia National Laboratories that includes several national 
+ * laboratories and universities. You can find out more at:
+ * http://www.v3vee.org  and
+ * http://xtack.sandia.gov/hobbes
+ *
+ * Copyright (c) 2016, Peter Dinda
+ * Copyright (c) 2016, Yang Wu, Fei Luo and Yuanhui Yang
+ * Copyright (c) 2016, The V3VEE Project  <http://www.v3vee.org> 
+ *                     The Hobbes Project <http://xstack.sandia.gov/hobbes>
+ * All rights reserved.
+ *
+ * Authors:  Peter Dinda <pdinda@northwestern.edu>
+ *           Yang Wu, Fei Luo and Yuanhui Yang
+ *           {YangWu2015, FeiLuo2015, YuanhuiYang2015}@u.northwestern.edu
+ *
+ * This is free software.  You are permitted to use,
+ * redistribute, and modify it as specified in the file "LICENSE.txt".
+ */
+
+#include <nautilus/nautilus.h>
+#include <nautilus/thread.h>
+#include <nautilus/queue.h>
+#include <nautilus/list.h>
+#include <dev/kbd.h>
+#include <nautilus/vc.h>
+#include <nautilus/printk.h>
+#include <dev/serial.h>
+#include <dev/vga.h>
+#ifdef NAUT_CONFIG_XEON_PHI
+#include <arch/k1om/xeon_phi.h>
+#endif
+#ifdef NAUT_CONFIG_HVM_HRT
+#include <arch/hrt/hrt.h>
+#endif
+
+#ifndef NAUT_CONFIG_DEBUG_VIRTUAL_CONSOLE
+#undef DEBUG_PRINT
+#define DEBUG_PRINT(fmt, args...) 
+#endif
+
+#define ERROR(fmt, args...) ERROR_PRINT("vc: " fmt, ##args)
+#define DEBUG(fmt, args...) DEBUG_PRINT("vc: " fmt, ##args)
+#define INFO(fmt, args...) INFO_PRINT("vc: " fmt, ##args)
+
+static spinlock_t state_lock;
+
+#define STATE_LOCK_CONF uint8_t _state_lock_flags
+#define STATE_LOCK() _state_lock_flags = spin_lock_irq_save(&state_lock)
+#define STATE_UNLOCK() spin_unlock_irq_restore(&state_lock, _state_lock_flags);
+
+#define BUF_LOCK_CONF uint8_t _buf_lock_flags
+#define BUF_LOCK(cons) _buf_lock_flags = spin_lock_irq_save(&cons->buf_lock)
+#define BUF_UNLOCK(cons) spin_unlock_irq_restore(&cons->buf_lock, _buf_lock_flags);
+
+#define QUEUE_LOCK_CONF uint8_t _queue_lock_flags
+#define QUEUE_LOCK(cons) _queue_lock_flags = spin_lock_irq_save(&cons->queue_lock)
+#define QUEUE_UNLOCK(cons) spin_unlock_irq_restore(&cons->queue_lock, _queue_lock_flags);
+
+
+static struct list_head vc_list;
+static struct nk_virtual_console *cur_vc = NULL;
+static struct nk_virtual_console *default_vc = NULL;
+static struct nk_virtual_console *log_vc = NULL;
+static struct nk_virtual_console *list_vc = NULL; 
+
+static nk_thread_id_t list_tid;
+
+#define Keycode_QUEUE_SIZE 256
+#define Scancode_QUEUE_SIZE 512
+#define SerialIn_QUEUE_SIZE 512
+#define SerialOut_QUEUE_SIZE 512
+
+struct nk_virtual_console {
+  enum nk_vc_type type;
+  char name[32];
+  // held with interrupts off => coordinate with interrupt handler
+  spinlock_t       queue_lock;
+  // held without interrupt change => coordinate with threads
+  spinlock_t       buf_lock;
+  union queue{
+    nk_scancode_t s_queue[Scancode_QUEUE_SIZE];
+    nk_keycode_t k_queue[Keycode_QUEUE_SIZE];
+  } keyboard_queue;
+ struct serial_queue
+ {
+	uchar_t sin[SerialIn_QUEUE_SIZE];
+	uchar_t sout[SerialOut_QUEUE_SIZE];
+ }serial_queue;
+
+  uint16_t BUF[VGA_WIDTH * VGA_HEIGHT];
+  uint8_t cur_x, cur_y, cur_attr;
+  uint16_t head, tail;
+  uint16_t head_out, head_in, tail_out, tail_in;
+  void    (*raw_noqueue_callback)(nk_scancode_t, void *priv);//?
+  void     *raw_noqueue_callback_priv;
+  uint32_t num_threads;
+  struct list_head vc_node;
+  nk_thread_queue_t *waiting_threads;
+};
+
+
+inline int nk_vc_is_active()
+{
+  return cur_vc!=0;
+}
+
+struct nk_virtual_console * nk_get_cur_vc()
+{
+    return cur_vc;
+}
+
+static inline void copy_display_to_vc(struct nk_virtual_console *vc) 
+{
+#ifdef NAUT_CONFIG_X86_64_HOST
+  vga_copy_out((void *)vc->BUF,sizeof(vc->BUF));
+#endif
+#ifdef NAUT_CONFIG_XEON_PHI
+  vga_copy_out((void *)vc->BUF,sizeof(vc->BUF));
+#endif
+#ifdef NAUT_CONFIG_HVM_HRT
+  // not supported
+#endif
+}
+
+static inline void copy_vc_to_display(struct nk_virtual_console *vc) 
+{ 
+#ifdef NAUT_CONFIG_X86_64_HOST
+  vga_copy_in((void*)vc->BUF,sizeof(vc->BUF));
+#endif
+#ifdef NAUT_CONFIG_XEON_PHI
+  vga_copy_in((void*)vc->BUF,sizeof(vc->BUF));
+#endif
+#ifdef NAUT_CONFIG_HVM_HRT
+  // not supported
+#endif
+}
+
+
+struct nk_virtual_console *nk_create_vc(char *name, enum nk_vc_type new_vc_type, uint8_t attr, void (*callback)(nk_scancode_t, void *priv), void *priv_data) 
+{
+  STATE_LOCK_CONF;
+  int i;
+
+  struct nk_virtual_console *new_vc = malloc(sizeof(struct nk_virtual_console));
+
+  if (!new_vc) {
+    ERROR("Failed to allocate new console\n");
+    return NULL;
+  }
+  memset(new_vc, 0, sizeof(struct nk_virtual_console));
+  new_vc->type = new_vc_type;
+  strncpy(new_vc->name,name,32);
+  new_vc->raw_noqueue_callback = callback;  
+  new_vc->raw_noqueue_callback_priv = priv_data;
+  new_vc->cur_attr = attr;
+  spinlock_init(&new_vc->queue_lock);
+  spinlock_init(&new_vc->buf_lock);
+  new_vc->head = 0;
+  new_vc->tail = 0;
+  new_vc->head_out = 0;
+  new_vc->head_in = 0;
+  new_vc->tail_out = 0;
+  new_vc->tail_in = 0;
+  new_vc->num_threads = 0;
+  new_vc->waiting_threads = nk_thread_queue_create();
+
+  // clear to new attr
+  for (i = 0; i < VGA_HEIGHT*VGA_WIDTH; i++) {
+    new_vc->BUF[i] = vga_make_entry(' ', new_vc->cur_attr);
+  }
+
+  STATE_LOCK();
+  list_add_tail(&new_vc->vc_node, &vc_list);
+  STATE_UNLOCK();
+  return new_vc;
+}
+
+
+static int _switch_to_vc(struct nk_virtual_console *vc) 
+{
+  if (!vc) {
+    return 0;
+  }
+  if (vc!=cur_vc) { 
+    copy_display_to_vc(cur_vc);
+    cur_vc = vc;
+    copy_vc_to_display(cur_vc);
+#ifdef NAUT_CONFIG_X86_64_HOST
+    vga_set_cursor(cur_vc->cur_x, cur_vc->cur_y);
+#elif NAUT_CONFIG_XEON_PHI
+    phi_cons_set_cursor(cur_vc->cur_x, cur_vc->cur_y);
+#endif
+  }
+  return 0;
+}
+
+static int _destroy_vc(struct nk_virtual_console *vc) 
+{
+
+  if (vc->num_threads || !nk_queue_empty_atomic(vc->waiting_threads)) { 
+    ERROR("Cannot destroy virtual console that has threads\n");
+    return -1;
+  }
+
+  if (vc==cur_vc) { 
+    _switch_to_vc(list_vc);
+  }
+
+  list_del(&vc->vc_node);
+  nk_thread_queue_destroy(vc->waiting_threads);
+  free(vc);
+  return 0;
+}
+
+int nk_destroy_vc(struct nk_virtual_console *vc) 
+{
+  STATE_LOCK_CONF;
+  int rc;
+
+  STATE_LOCK();
+  rc=_destroy_vc(vc);
+  STATE_UNLOCK();
+  return rc;
+}
+
+
+int nk_bind_vc(nk_thread_t *thread, struct nk_virtual_console * cons)
+{
+  STATE_LOCK_CONF;
+  if (!cons) { 
+    return -1;
+  }
+  STATE_LOCK();
+  thread->vc = cons;
+  cons->num_threads++;
+  STATE_UNLOCK();
+  return 0;
+}
+
+//release will destroy vc once the number of binders drops to zero
+//except that the default vc is never destroyed
+int nk_release_vc(nk_thread_t *thread) 
+{
+  STATE_LOCK_CONF;
+
+  if (!thread || !thread->vc) { 
+    return 0;
+  }
+  STATE_LOCK();
+  thread->vc->num_threads--;
+  if(thread->vc->num_threads == 0) {
+    if(thread->vc != default_vc) {//And it shouldn't be the default vc
+      _destroy_vc(thread->vc);
+    }
+  }
+  thread->vc = NULL;
+  STATE_UNLOCK();
+  return 0;
+}
+
+int nk_switch_to_vc(struct nk_virtual_console *vc) 
+{
+  int rc;
+  STATE_LOCK_CONF;
+
+  STATE_LOCK();
+  rc = _switch_to_vc(vc);
+  STATE_UNLOCK();
+  
+  return rc;
+}
+
+int nk_switch_to_prev_vc()
+{
+  struct list_head *cur_node = &cur_vc->vc_node;
+  struct nk_virtual_console *target;
+  
+  if(cur_node->prev == &vc_list) {
+    return 0;
+  }
+  target = container_of(cur_node->prev, struct nk_virtual_console, vc_node);
+  return nk_switch_to_vc(target);
+}
+
+int nk_switch_to_next_vc()
+{
+  struct list_head *cur_node = &cur_vc->vc_node;
+  struct nk_virtual_console *target;
+
+  if(cur_node->next == &vc_list) {
+    return 0;
+  }
+
+  target = container_of(cur_node->next, struct nk_virtual_console, vc_node);
+  return nk_switch_to_vc(target);
+
+}
+
+
+static int _vc_scrollup_specific(struct nk_virtual_console *vc) 
+{
+  int i;
+
+#ifdef NAUT_CONFIG_XEON_PHI
+  if (vc==cur_vc) {
+    phi_cons_notify_scrollup();
+  }
+#endif
+
+  for (i=0;
+       i<VGA_WIDTH*(VGA_HEIGHT-1);
+       i++) {
+    vc->BUF[i] = vc->BUF[i+VGA_WIDTH];
+  }
+
+  for (i = VGA_WIDTH*(VGA_HEIGHT-1);
+       i < VGA_WIDTH*VGA_HEIGHT; 
+       i++) {
+    vc->BUF[i] = vga_make_entry(' ', vc->cur_attr);
+  }
+
+  if(vc == cur_vc) {
+    copy_vc_to_display(vc);
+#ifdef NAUT_CONFIG_XEON_PHI
+    phi_cons_notify_redraw();
+#endif
+  }
+
+  return 0;
+}
+
+int nk_vc_scrollup_specific(struct nk_virtual_console *vc) 
+{
+  BUF_LOCK_CONF;
+  int rc;
+  if (!vc) { 
+    return 0;
+  }
+  BUF_LOCK(vc);
+  rc = _vc_scrollup_specific(vc);
+  BUF_UNLOCK(vc);
+  return rc;
+}
+
+int nk_vc_scrollup()
+{
+  int rc=0;
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+  if (vc) { 
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    rc = _vc_scrollup_specific(vc);
+    BUF_UNLOCK(vc);
+  }
+
+  return rc;
+}
+
+static int _vc_display_char_specific(struct nk_virtual_console *vc, uint8_t c, uint8_t attr, uint8_t x, uint8_t y) 
+{
+  if (!vc) { 
+    return 0;
+  }
+
+  uint16_t val = vga_make_entry (c, attr);
+
+  if(x >= VGA_WIDTH || y >= VGA_HEIGHT) {
+    return -1;
+  } else {
+    vc->BUF[y * VGA_WIDTH + x] = val;
+    if(vc == cur_vc) {
+#ifdef NAUT_CONFIG_X86_64_HOST
+      vga_write_screen(x,y,val);
+      vga_set_cursor(cur_vc->cur_x, cur_vc->cur_y);
+#endif
+#ifdef NAUT_CONFIG_XEON_PHI
+      vga_write_screen(x,y,val);
+      phi_cons_set_cursor(cur_vc->cur_x, cur_vc->cur_y);
+#endif
+
+    }
+  }
+  return 0;
+}
+
+static int _vc_display_char(uint8_t c, uint8_t attr, uint8_t x, uint8_t y) 
+{
+  struct nk_virtual_console *thread_vc = get_cur_thread()->vc; 
+  if (!thread_vc) { 
+    thread_vc = default_vc;
+  }
+  if (!thread_vc) { 
+    return 0;
+  } else {
+    return _vc_display_char_specific(thread_vc,c,attr,x,y);
+  }
+}
+
+int nk_vc_display_char_specific(struct nk_virtual_console *vc,
+				uint8_t c, uint8_t attr, uint8_t x, uint8_t y)
+{
+  int rc = -1;
+
+  if (vc) { 
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    rc = _vc_display_char_specific(vc, c, attr, x, y);
+    BUF_UNLOCK(vc);
+  }
+  return rc;
+}
+
+int nk_vc_display_char(uint8_t c, uint8_t attr, uint8_t x, uint8_t y) 
+{
+  int rc=0;
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+  if (vc) { 
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    rc = _vc_display_char(c,attr,x,y);
+    BUF_UNLOCK(vc);
+  }
+
+  return rc;
+}
+  
+
+static int _vc_setpos(uint8_t x, uint8_t y) 
+{
+  int rc=0;
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+  if (vc) { 
+    vc->cur_x = x;
+    vc->cur_y = y;
+#ifdef NAUT_CONFIG_X86_64_HOST
+    if (vc==cur_vc) { 
+      vga_set_cursor(cur_vc->cur_x, cur_vc->cur_y);
+    }
+#endif
+  }
+  return 0;
+}
+
+
+int nk_vc_setpos(uint8_t x, uint8_t y) 
+{
+  int rc=0;
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+  if (vc) { 
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    rc = _vc_setpos(x,y);
+    BUF_UNLOCK(vc)
+  }
+
+  return rc;
+}
+
+static int _vc_setpos_specific(struct nk_virtual_console *vc, uint8_t x, uint8_t y) 
+{
+  int rc=0;
+
+  if (vc) { 
+    vc->cur_x = x;
+    vc->cur_y = y;
+#ifdef NAUT_CONFIG_X86_64_HOST
+    if (vc==cur_vc) { 
+      vga_set_cursor(cur_vc->cur_x, cur_vc->cur_y);
+    }
+#endif
+  }
+
+  return rc;
+}
+
+
+int nk_vc_setpos_specific(struct nk_virtual_console *vc, uint8_t x, uint8_t y) 
+{
+  int rc=0;
+
+  if (vc) { 
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    rc = _vc_setpos_specific(vc,x,y);
+    BUF_UNLOCK(vc);
+  }
+
+  return rc;
+}
+
+
+// display scrolling or explicitly on screen at a given location
+static int _vc_putchar_specific(struct nk_virtual_console *vc, uint8_t c) 
+{
+  if (!vc) { 
+    return 0;
+  }
+  if (c == '\n') {
+    vc->cur_x = 0;
+#ifdef NAUT_CONFIG_XEON_PHI
+    if (vc==cur_vc) { 
+      phi_cons_notify_line_draw(vc->cur_y);
+    }
+#endif
+    vc->cur_y++;
+    if (vc->cur_y == VGA_HEIGHT) {
+      _vc_scrollup_specific(vc);
+      vc->cur_y--;
+    }
+    if (vc==cur_vc) {
+#ifdef NAUT_CONFIG_X86_64_HOST
+      vga_set_cursor(vc->cur_x,vc->cur_y);
+#elif NAUT_CONFIG_XEON_PHI
+      phi_cons_set_cursor(vc->cur_x,vc->cur_y);
+#endif
+    }
+    return 0;
+  }
+  _vc_display_char_specific(vc, c, vc->cur_attr, vc->cur_x, vc->cur_y);
+  vc->cur_x++;
+  if (vc->cur_x == VGA_WIDTH) {
+    vc->cur_x = 0;
+#ifdef NAUT_CONFIG_XEON_PHI
+    if (vc==cur_vc) {
+      phi_cons_notify_line_draw(vc->cur_y);
+    }
+#endif
+    vc->cur_y++;
+    if (vc->cur_y == VGA_HEIGHT) {
+      _vc_scrollup_specific(vc);
+      vc->cur_y--;
+    }
+  }
+  if (vc==cur_vc) { 
+#ifdef NAUT_CONFIG_X86_64_HOST
+    vga_set_cursor(vc->cur_x, vc->cur_y);
+#elif NAUT_CONFIG_XEON_PHI
+      phi_cons_set_cursor(vc->cur_x,vc->cur_y);
+#endif
+  }
+  return 0;
+}
+
+// display scrolling or explicitly on screen at a given location
+static int _vc_putchar(uint8_t c) 
+{
+  struct nk_virtual_console *vc;
+  struct nk_thread *t = get_cur_thread();
+
+  if (!t || !(vc = t->vc)) {
+    vc = default_vc;
+  }
+
+  if (!vc) { 
+    return 0;
+  } else {
+    return _vc_putchar_specific(vc,c);
+  }
+}
+
+int nk_vc_putchar(uint8_t c) 
+{
+  if (nk_vc_is_active()) { 
+    struct nk_virtual_console *vc;
+    struct nk_thread *t = get_cur_thread();
+    
+    if (!t || !(vc = t->vc)) { 
+      vc = default_vc;
+    }
+    if (vc) {
+      BUF_LOCK_CONF;
+      BUF_LOCK(vc);
+      _vc_putchar_specific(vc,c);
+      BUF_UNLOCK(vc);
+    }
+  } 
+  else {
+
+#ifdef NAUT_CONFIG_X86_64_HOST
+    vga_putchar(c);
+#endif
+#ifdef NAUT_CONFIG_HVM_HRT
+    hrt_putchar(c);
+#endif
+#ifdef NAUT_CONFIG_XEON_PHI
+    phi_cons_putchar(c);
+#endif
+  }
+
+  //nk_vc_put_serial(1, c);
+  // if turned on, drop eveything into serial port and print it out in Linux
+#ifdef NAUT_CONFIG_VIRTUAL_CONSOLE_SERIAL_MIRROR_ALL
+  serial_putchar(c);
+  //nk_vc_put_serial(1, c);
+#endif
+  return c;
+}
+
+
+static int _vc_print_specific(struct nk_virtual_console *vc, char *s) 
+{
+  if (!vc) { 
+    return 0;
+  }
+  while(*s) {
+    _vc_putchar_specific(vc, *s);
+    s++;
+  }
+  return 0;
+}
+
+
+static int vc_print_specific(struct nk_virtual_console *vc, char *s)
+{
+    //int wait =1;
+    if (!vc) {
+        return 0;
+    }
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    _vc_print_specific(vc,s);
+    BUF_UNLOCK(vc);
+    //nk_vc_print_serial(1, s);
+#ifdef NAUT_CONFIG_VIRTUAL_CONSOLE_SERIAL_MIRROR_ALL
+    //nk_vc_print_serial(1, s);
+    serial_write(s);
+#endif
+    return 0;
+}
+
+int nk_vc_print(char *s)
+{
+  if (nk_vc_is_active()) { 
+    struct nk_virtual_console *vc;
+    struct nk_thread * t = get_cur_thread();
+    
+    if (!t || !(vc = t->vc)) { 
+      vc = default_vc;
+    }
+    if (vc) {
+      BUF_LOCK_CONF;
+      BUF_LOCK(vc);
+      _vc_print_specific(vc,s);
+      BUF_UNLOCK(vc);
+    }
+  } 
+  else {
+#ifdef NAUT_CONFIG_X86_64_HOST
+    vga_print(s);
+#endif
+#ifdef NAUT_CONFIG_HVM_HRT
+    hrt_print(s);
+#endif
+#ifdef NAUT_CONFIG_XEON_PHI
+    phi_cons_print(s);
+#endif
+
+  }
+//nk_vc_print_serial(1, s);
+  //serial_write(s);
+#ifdef NAUT_CONFIG_VIRTUAL_CONSOLE_SERIAL_MIRROR_ALL
+  serial_write(s);
+  //nk_vc_print_serial(1, s);
+#endif
+  return 0;
+}
+
+int nk_vc_puts(char *s)
+{
+  nk_vc_print(s);
+  nk_vc_putchar('\n');
+  return 0;
+}
+
+#define PRINT_MAX 1024
+
+int nk_vc_printf(char *fmt, ...)
+{
+  char buf[PRINT_MAX];
+
+  va_list args;
+  int i;
+
+  va_start(args, fmt);
+  i=vsnprintf(buf,PRINT_MAX,fmt,args);
+  va_end(args);
+  nk_vc_print(buf);
+  return i;
+}
+
+int nk_vc_printf_specific(struct nk_virtual_console *vc, char *fmt, ...)
+{
+  char buf[PRINT_MAX];
+
+  va_list args;
+  int i;
+
+  va_start(args, fmt);
+  i=vsnprintf(buf,PRINT_MAX,fmt,args);
+  va_end(args);
+  vc_print_specific(vc, buf);
+  return i;
+}
+
+int nk_vc_log(char *fmt, ...)
+{
+  char buf[PRINT_MAX];
+
+  va_list args;
+  int i;
+  
+  va_start(args, fmt);
+  i=vsnprintf(buf,PRINT_MAX,fmt,args);
+  va_end(args);
+  
+  if (!log_vc) { 
+    // no output to screen possible yet
+  } else {
+    BUF_LOCK_CONF;
+    BUF_LOCK(log_vc);
+    _vc_print_specific(log_vc, buf);
+    BUF_UNLOCK(log_vc);
+  }
+  //nk_vc_print_serial(1, buf);
+#ifdef NAUT_CONFIG_VIRTUAL_CONSOLE_SERIAL_MIRROR
+  serial_write(buf);
+  //nk_vc_print_serial(1, buf);
+#endif
+  
+  return i;
+}
+
+static int _vc_setattr_specific(struct nk_virtual_console *vc, uint8_t attr)
+{
+  vc->cur_attr = attr; 
+  return 0;
+}
+
+
+int nk_vc_setattr_specific(struct nk_virtual_console *vc, uint8_t attr)
+{
+  if (vc) { 
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    _vc_setattr_specific(vc,attr);
+    BUF_UNLOCK(vc);
+  }
+  return 0;
+
+}
+
+int nk_vc_setattr(uint8_t attr)
+{
+  struct nk_virtual_console *vc;
+  struct nk_thread *t = get_cur_thread();
+
+  if (!t || !(vc = t->vc)) { 
+    vc = default_vc;
+  }
+  if (vc) { 
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    _vc_setattr_specific(vc,attr);
+    BUF_UNLOCK(vc);
+  }
+  return 0;
+}
+
+static int _vc_clear_specific(struct nk_virtual_console *vc, uint8_t attr)
+{
+  int i;
+  uint16_t val = vga_make_entry (' ', attr);
+
+  vc->cur_attr = attr;
+    
+  for (i = 0; i < VGA_HEIGHT*VGA_WIDTH; i++) {
+    vc->BUF[i] = val;
+  }
+  
+  if (vc==cur_vc) { 
+    copy_vc_to_display(vc);
+#ifdef NAUT_CONFIG_XEON_PHI
+    phi_cons_notify_redraw();
+#endif
+  }
+  
+  vc->cur_x=0;
+  vc->cur_y=0;
+  return 0;
+}
+
+
+int nk_vc_clear_specific(struct nk_virtual_console *vc, uint8_t attr)
+{
+  if (vc) { 
+    BUF_LOCK_CONF;
+    BUF_LOCK(vc);
+    _vc_clear_specific(vc,attr);
+    BUF_UNLOCK(vc);
+  }
+  return 0;
+}
+
+int nk_vc_clear(uint8_t attr)
+{
+  BUF_LOCK_CONF;
+  struct nk_thread *t = get_cur_thread();
+  struct nk_virtual_console *vc;
+
+  if (!t || !(vc = t->vc)) { 
+    vc = default_vc;
+  }
+
+  if (!vc) { 
+    return 0;
+  }
+     
+  BUF_LOCK(vc);
+  _vc_clear_specific(vc,attr);
+  BUF_UNLOCK(vc);
+  return 0;
+}
+
+
+
+// called assuming lock is held
+static inline int next_index_on_queue(enum nk_vc_type type, int index) 
+{ //enum nk_vc_type {RAW, COOKED, RAW_NOQUEUE};
+  if (type == RAW) { 
+    return (index + 1) % Scancode_QUEUE_SIZE;
+  } else if (type == COOKED) {
+    return (index + 1) % Keycode_QUEUE_SIZE;
+  } else {
+    ERROR("Using index on a raw, unqueued VC\n");
+    return 0;
+  }
+}
+
+// called assuming lock is held
+static inline int next_index_on_SerialOutqueue( int index) 
+{ 
+    return (index + 1) % SerialOut_QUEUE_SIZE;
+
+}
+
+
+// called assuming lock is held
+static inline int next_index_on_SerialInqueue( int index) 
+{ 
+    return (index + 1) % SerialIn_QUEUE_SIZE;
+
+}
+
+// called assuming lock is held
+static inline int is_queue_empty(struct nk_virtual_console *vc) 
+{
+  return vc->head == vc->tail;
+}
+
+// called assuming lock is held
+static inline int is_queue_full(struct nk_virtual_console *vc) 
+{
+  return next_index_on_queue(vc->type, vc->tail) == vc->head;
+}
+
+// check if serialout queue is full(before enqueue)
+static inline int is_SerialOut_full(struct nk_virtual_console *vc) 
+{
+  return next_index_on_SerialOutqueue(vc->tail_out) == vc->head_out;
+}
+
+// check if serialin queue is full(before enqueue)
+static inline int is_SerialIn_full(struct nk_virtual_console *vc) 
+{
+  return next_index_on_SerialInqueue(vc->tail_in) == vc->head_in;
+}
+
+// check if serialout queue is empty(before dequeue)
+static inline int is_SerialOut_empty(struct nk_virtual_console *vc) 
+{
+  return vc->head_out == vc->tail_out;
+}
+
+// check if serialin queue is empty(before dequeue)
+static inline int is_SerialIn_empty(struct nk_virtual_console *vc) 
+{
+  return vc->head_in == vc->tail_in;
+}
+
+// called without lock
+int nk_enqueue_scancode(struct nk_virtual_console *vc, nk_scancode_t scan) 
+{
+  QUEUE_LOCK_CONF;
+
+  QUEUE_LOCK(vc);
+
+  if(vc->type != RAW || is_queue_full(vc)) {
+    DEBUG("Cannot enqueue scancode 0x%x (queue is %s)\n",scan, is_queue_full(vc) ? "full" : "not full");
+    QUEUE_UNLOCK(vc);
+    return -1;
+  } else {
+    vc->keyboard_queue.s_queue[vc->tail] = scan;
+    vc->tail = next_index_on_queue(vc->type, vc->tail);
+    QUEUE_UNLOCK(vc);
+    nk_thread_queue_wake_all(vc->waiting_threads);
+    return 0;
+  }
+}
+
+int nk_enqueue_keycode(struct nk_virtual_console *vc, nk_keycode_t key) 
+{
+  QUEUE_LOCK_CONF;
+
+  QUEUE_LOCK(vc);
+
+  if(vc->type != COOKED || is_queue_full(vc)) {
+    DEBUG("Cannot enqueue keycode 0x%x (queue is %s)\n",key,is_queue_full(vc) ? "full" : "not full");
+    QUEUE_UNLOCK(vc);
+    return -1;
+  } else {
+    vc->keyboard_queue.k_queue[vc->tail] = key;
+    vc->tail = next_index_on_queue(vc->type, vc->tail);
+    QUEUE_UNLOCK(vc);
+    nk_thread_queue_wake_all(vc->waiting_threads);
+    return 0;
+  }
+}
+
+//serial.c(receiver)---->(enqueue)-->vc(serialIn)-->(dequeue)-----> LIKE KEYBOARD
+int nk_enqueue_serial_in(struct nk_virtual_console *vc, uchar_t c) 
+{
+  QUEUE_LOCK_CONF;
+
+  QUEUE_LOCK(vc);
+
+  if( is_SerialIn_full(vc)) {
+    DEBUG("Cannot enqueue char 0x%x (queue is %s)\n",c, is_SerialIn_full(vc) ? "full" : "not full");
+    QUEUE_UNLOCK(vc);
+    return -1;
+  } else {
+    vc->serial_queue.sin[vc->tail_in] = c;
+
+    // print for debug
+    nk_vc_printf("%c\n",c);
+
+    vc->tail_in = next_index_on_SerialInqueue(vc->tail_in);
+    QUEUE_UNLOCK(vc);
+    nk_thread_queue_wake_all(vc->waiting_threads);
+    return 0;
+  }
+}
+
+//serial.c(transmitter)<----(dequeue)<--vc(serialOut)-->(enqueue)<-----
+int nk_enqueue_serial_out(struct nk_virtual_console *vc, uchar_t c) 
+{
+  QUEUE_LOCK_CONF;
+
+  QUEUE_LOCK(vc);
+
+  if( is_SerialOut_full(vc)) {
+    DEBUG("Cannot enqueue char 0x%x (queue is %s)\n",c, is_SerialOut_full(vc) ? "full" : "not full");
+    QUEUE_UNLOCK(vc);
+    return -1;
+  } else {
+    vc->serial_queue.sout[vc->tail_out] = c;
+    
+    // print on the qemu just for DEBUG
+    //nk_vc_printf("char:%c.", vc->serial_queue.sout[vc->tail_out]);
+    //printk("Enqueue serial out");
+
+    vc->tail_out = next_index_on_SerialOutqueue(vc->tail_out);
+    QUEUE_UNLOCK(vc);
+    //nk_thread_queue_wake_all(vc->waiting_threads);
+    return 0;
+  }
+}
+
+nk_scancode_t nk_dequeue_scancode(struct nk_virtual_console *vc) 
+{
+  QUEUE_LOCK_CONF;
+
+  QUEUE_LOCK(vc);
+
+  if(vc->type != RAW || is_queue_empty(vc)) {
+    DEBUG("Cannot dequeue scancode (queue is %s)\n",is_queue_empty(vc) ? "empty" : "not empty");
+    QUEUE_UNLOCK(vc);
+    return NO_SCANCODE;
+  } else {
+    nk_scancode_t result;
+    result = vc->keyboard_queue.s_queue[vc->head];
+    vc->head = next_index_on_queue(vc->type, vc->head);
+    QUEUE_UNLOCK(vc);
+    return result;
+  }
+}
+
+nk_keycode_t nk_dequeue_keycode(struct nk_virtual_console *vc) 
+{
+  QUEUE_LOCK_CONF;
+
+  QUEUE_LOCK(vc);
+
+  if (vc->type != COOKED || is_queue_empty(vc)) {
+    DEBUG("Cannot dequeue keycode (queue is %s)\n",is_queue_empty(vc) ? "empty" : "not empty");
+    QUEUE_UNLOCK(vc);
+    return NO_KEY;
+  } else {
+    nk_keycode_t result;
+    result = vc->keyboard_queue.k_queue[vc->head];
+    vc->head = next_index_on_queue(vc->type, vc->head);
+    QUEUE_UNLOCK(vc);
+    return result;
+  }
+}
+
+uchar_t nk_dequeue_serial_in(struct nk_virtual_console *vc) 
+{
+  QUEUE_LOCK_CONF;
+
+  QUEUE_LOCK(vc);
+
+  if( is_SerialIn_empty(vc)) {
+    DEBUG("Cannot dequeue char (queue is %s)\n",is_SerialIn_empty(vc) ? "empty" : "not empty");
+    QUEUE_UNLOCK(vc);
+    return NO_CHAR;
+  } else {
+    uchar_t result;
+    result = vc->serial_queue.sin[vc->head_in];
+    vc->head_in = next_index_on_SerialInqueue(vc->head_in);
+    QUEUE_UNLOCK(vc);
+    return result;
+  }
+}
+
+uchar_t nk_dequeue_serial_out(struct nk_virtual_console *vc){
+  QUEUE_LOCK_CONF;
+
+  QUEUE_LOCK(vc);
+
+  if( is_SerialOut_empty(vc)) {
+    nk_vc_printf("serialout is empty\n");
+    //DEBUG("Cannot dequeue char (queue is %s)\n",is_SerialOut_empty(vc) ? "empty" : "not empty");
+    QUEUE_UNLOCK(vc);
+    return NO_CHAR;
+  } else {
+
+    uchar_t result;
+    result = vc->serial_queue.sout[vc->head_out];
+
+    // just for DEBUG
+    nk_vc_printf("\nserialout has %c\n", result);
+
+    vc->head_out = next_index_on_SerialOutqueue(vc->head_out);
+    
+    // print for Debug
+/*    if ( vc->serial_queue.sout[vc->head_out] != result) {
+      nk_vc_printf("dequeue it %c from Serial Out successfully!", result);
+    }*/
+
+    QUEUE_UNLOCK(vc);
+    return result;
+  }
+}
+
+void nk_vc_wait()
+{
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+
+  nk_thread_queue_sleep(vc->waiting_threads);
+}
+
+
+nk_keycode_t nk_vc_get_keycode(int wait) 
+{
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+
+  if (vc->type != COOKED) {
+    ERROR("Incorrect type of VC for get_keycode\n");
+    return NO_KEY;
+  }
+
+  while (1) { 
+    nk_keycode_t k = nk_dequeue_keycode(vc);
+    if (k!=NO_KEY) { 
+      DEBUG("Returning keycode 0x%x\n",k);
+      return k;
+    } 
+    if (wait) { 
+      nk_vc_wait();
+    } else {
+      return NO_KEY;
+    }
+  }
+}
+
+int nk_vc_getchar_extended(int wait)
+{
+  nk_keycode_t key;
+
+  while (1) { 
+    key = nk_vc_get_keycode(wait);
+    
+    switch (key) { 
+    case KEY_UNKNOWN:
+    case KEY_LCTRL:
+    case KEY_RCTRL:
+    case KEY_LSHIFT:
+    case KEY_RSHIFT:
+    case KEY_PRINTSCRN:
+    case KEY_LALT:
+    case KEY_RALT:
+    case KEY_CAPSLOCK:
+    case KEY_F1:
+    case KEY_F2:
+    case KEY_F3:
+    case KEY_F4:
+    case KEY_F5:
+    case KEY_F6:
+    case KEY_F7:
+    case KEY_F8:
+    case KEY_F9:
+    case KEY_F10:
+    case KEY_F11:
+    case KEY_F12:
+    case KEY_NUMLOCK:
+    case KEY_SCRLOCK:
+    case KEY_KPHOME:
+    case KEY_KPUP:
+    case KEY_KPMINUS:
+    case KEY_KPLEFT:
+    case KEY_KPCENTER:
+    case KEY_KPRIGHT:
+    case KEY_KPPLUS:
+    case KEY_KPEND:
+    case KEY_KPDOWN:
+    case KEY_KPPGDN:
+    case KEY_KPINSERT:
+    case KEY_KPDEL:
+    case KEY_SYSREQ:
+      DEBUG("Ignoring special key 0x%x\n",key);
+      continue;
+      break;
+    default: {
+      int c = key&0xff;
+      if (c=='\r') { 
+	c='\n';
+      }
+      DEBUG("Regular key 0x%x ('%c')\n", c, c);
+      return c;
+    }
+    }
+  }
+}
+
+uchar_t nk_vc_get_serial(int wait) 
+{
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+
+
+  while (1) { 
+    uchar_t c = nk_dequeue_serial_in(vc);
+    if (c!=NO_CHAR) { 
+      nk_vc_putchar(c);
+      //DEBUG("Returning char 0x%x\n",c);
+      return c;
+    } 
+    if (wait) { 
+      nk_vc_wait();
+    } else {
+      return NO_CHAR;
+    }
+  }
+}
+
+int nk_vc_put_serial(int wait, uchar_t c) 
+{
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+/*
+  if(c!=NO_CHAR){
+    nk_enqueue_serial_out(vc,c);
+  }
+  return c;
+*/
+
+  while (1) { 
+    if (nk_enqueue_serial_out(vc,c)) {
+      if (wait){
+	nk_vc_wait();
+      } else {
+	DEBUG("NO_ROOM");
+	return 0;
+      }
+    }
+
+   /*
+    if (wait) { 
+      nk_vc_wait();
+    } else if (c!=NO_CHAR){
+      nk_enqueue_serial_out(vc,c);
+      //DEBUG("Returning char 0x%x\n",c);
+      return 0;
+    }
+      else{
+        DEBUG("NO_CHAR");
+        return 0;
+      }*/
+  }
+
+}
+
+
+int nk_vc_print_serial(int wait, char * s) 
+{
+
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+    
+  while(*s)
+  {
+    nk_vc_put_serial(wait, *s);
+    ++s;
+    /*if(*s == NO_CHAR)
+    {
+      DEBUG("NO_CHAR");
+      return 0;
+    }*/
+  } 
+  return 0;    
+}
+
+int nk_vc_getchar()
+{
+  return nk_vc_getchar_extended(1);
+}
+
+int nk_vc_gets(char *buf, int n, int display)
+{
+  int i;
+  int c;
+  for (i=0;i<(n-1);i++) {
+    buf[i] = nk_vc_getchar();
+    nk_vc_put_serial(1, buf[i]);
+    if (display) { 
+      nk_vc_putchar(buf[i]);
+    }
+    if (buf[i] == '\n') {
+      buf[i] = 0;
+      return i;
+    }
+  }
+  buf[n-1]=0;
+  return n-1;
+}
+
+nk_scancode_t nk_vc_get_scancode(int wait)
+{
+  struct nk_virtual_console *vc = get_cur_thread()->vc;
+
+  if (!vc) { 
+    vc = default_vc;
+  }
+
+  if (vc->type != RAW) {
+    ERROR("Incorrect type of VC for get_scancode\n");
+    return NO_SCANCODE;
+  }
+
+  while (1) {
+    nk_scancode_t s = nk_dequeue_scancode(vc);
+    if (s!=NO_SCANCODE) {
+      return s;
+    }
+    if (wait) { 
+      nk_vc_wait();
+    } else {
+      return NO_SCANCODE;
+    }
+  }
+}
+
+static int enqueue_scancode_as_keycode(struct nk_virtual_console *cur_vc, uint8_t scan)
+{
+  nk_keycode_t key = kbd_translate(scan);
+  if(key != NO_KEY) {
+    nk_enqueue_keycode(cur_vc, key);
+  }
+  return 0;
+}
+
+int nk_vc_handle_input(nk_scancode_t scan) 
+{
+  DEBUG("Input: %x\n",scan);
+  switch (cur_vc->type) { 
+  case RAW_NOQUEUE:
+    DEBUG("Delivering event to console %s via callback\n",cur_vc->name);
+    cur_vc->raw_noqueue_callback(scan, cur_vc->raw_noqueue_callback_priv);
+    return 0;
+    break;
+  case RAW:
+    return nk_enqueue_scancode(cur_vc, scan);
+    break;
+  case COOKED:
+    return enqueue_scancode_as_keycode(cur_vc, scan);
+    break;
+  default:
+    ERROR("vc %s does not have a valid type\n",cur_vc->name);
+    break;
+  }
+  return 0;
+}
+
+//handler for SerialIn, data from receiver FIFO in serial.c
+int nk_vc_handle_input_serial(uchar_t c) 
+{
+  DEBUG("Input: %c\n",c);
+
+    return nk_enqueue_serial_in(cur_vc, c);
+    
+  //return 0;
+}
+
+//handler for SerialOut, data to transmitter FIFO in serial.c//////////
+uchar_t nk_vc_handle_output_serial() 
+{
+  uchar_t c = nk_dequeue_serial_out(cur_vc);
+  //DEBUG("Input: %c\n",c);
+
+
+  // just for DEBUG
+  //nk_vc_printf("char:%c.", c);
+
+    return c;
+    
+  //return 0;
+}
+
+
+static void list(void *in, void **out)
+{
+  struct list_head *cur;
+  int i;
+
+
+  if (!list_vc) { 
+    ERROR("No virtual console for list..\n");
+    return;
+  }
+  
+  if (nk_thread_name(get_cur_thread(),"vc-list")) {   
+    ERROR_PRINT("Cannot name vc-list's thread\n");
+    return;
+  }
+
+  if (nk_bind_vc(get_cur_thread(), list_vc)) { 
+    ERROR("Cannot bind virtual console for list\n");
+    return;
+  }
+  
+  while (1) {
+    nk_vc_clear(0xf9);
+   
+    nk_vc_print("List of VCs (space to regenerate)\n\n");
+
+    i=0;
+    list_for_each(cur,&vc_list) {
+      nk_vc_printf("%c : %s\n", 'a'+i, list_entry(cur,struct nk_virtual_console, vc_node)->name);
+      i++;
+    }
+
+    int c = nk_vc_getchar(1);
+    
+    i=0;
+    list_for_each(cur,&vc_list) {
+      if (c == (i+'a')) { 
+	nk_switch_to_vc(list_entry(cur,struct nk_virtual_console, vc_node));
+	break;
+      }
+      i++;
+    }
+  }
+}
+
+int nk_switch_to_vc_list()
+{
+  return nk_switch_to_vc(list_vc);
+}
+
+static int start_list()
+{
+
+  if (nk_thread_start(list, 0, 0, 1, PAGE_SIZE_4KB, &list_tid, -1)) {
+    ERROR("Failed to launch VC list\n");
+    return -1;
+  }
+  
+  INFO("List launched\n");
+
+  return 0;
+}
+
+int nk_vc_init() 
+{
+  INFO("init\n");
+  spinlock_init(&state_lock);
+  INIT_LIST_HEAD(&vc_list);
+
+
+  default_vc = nk_create_vc("default", COOKED, 0x0f, 0, 0);
+  if(!default_vc) {
+    ERROR("Cannot create default console...\n");
+    return -1;
+  }
+
+  log_vc = nk_create_vc("system-log", COOKED, 0x0a, 0, 0);
+  if(!log_vc) {
+    ERROR("Cannot create log console...\n");
+    return -1;
+  }
+  
+
+  list_vc = nk_create_vc("vc-list", COOKED, 0xf9, 0, 0);
+  if(!list_vc) {
+    ERROR("Cannot create vc list console...\n");
+    return -1;
+  }
+
+  if (start_list()) { 
+    ERROR("Cannot create vc list thread\n");
+    return -1;
+  }
+
+  cur_vc = default_vc;
+  copy_display_to_vc(cur_vc);
+  
+#ifdef NAUT_CONFIG_X86_64_HOST
+  vga_get_cursor(&(cur_vc->cur_x),&(cur_vc->cur_y));
+  vga_init_screen();
+  vga_set_cursor(cur_vc->cur_x,cur_vc->cur_y);
+#elif NAUT_CONFIG_XEON_PHI
+  phi_cons_get_cursor(&(cur_vc->cur_x), &(cur_vc->cur_y));
+  phi_cons_clear_screen();
+  phi_cons_set_cursor(cur_vc->cur_x, cur_vc->cur_y);
+#endif
+
+  return 0;
+}
+
+
+int nk_vc_deinit()
+{
+  struct list_head *cur;
+
+  nk_thread_destroy(list_tid);
+
+  // deactivate VC
+  cur_vc = 0;
+
+  list_for_each(cur,&vc_list) {
+    if (nk_destroy_vc(list_entry(cur,struct nk_virtual_console, vc_node))) { 
+      ERROR("Failed to destroy all VCs\n");
+      return -1;
+    }
+  }
+  return 0;
+}

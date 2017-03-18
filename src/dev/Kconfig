@@ -1,0 +1,141 @@
+menu "Device options"
+
+config SERIAL_REDIRECT
+    bool "Serial Debugging"
+    depends on !HVM_HRT
+    default n
+    help
+        Redirect all printing to serial device
+
+config SERIAL_PORT
+    int "Serial COM Port"
+    range 1 4
+    default "1"
+    help
+      Specifies which serial port to use. E.g. 1 is COM1.
+
+config APIC_FORCE_XAPIC_MODE
+    bool "Force APIC to use XAPIC mode"
+    default n
+    help
+       Force the use of XAPIC mode even if X2APIC mode is available
+
+config APIC_TIMER_CALIBRATE_INDEPENDENTLY
+    bool "Calibrate APIC timer independently on each core"
+    default n
+    help
+      If set, each core's APIC timer is independently calibrated
+      If not set, only the BSP core's timer is calibrated and
+      other cores clone its calibration
+
+
+config DEBUG_APIC
+    bool "Debug APIC"
+    depends on DEBUG_PRINTS
+    default n
+    help
+        Turn on debug prints for the LAPIC driver
+
+config DEBUG_IOAPIC
+    bool "DEBUG IOAPIC"
+    depends on DEBUG_PRINTS
+    default n
+    help 
+        Turn on debug prints for the IOAPIC driver
+
+config DEBUG_PCI
+    bool "Debug PCI"
+    depends on DEBUG_PRINTS
+    default n
+    help 
+        Turn on debug prints for PCI devices
+
+config DEBUG_KBD
+    bool "Debug Keyboard"
+    depends on DEBUG_PRINTS
+    default n
+    help
+        Turn on debug prints for the keyboard
+
+config DEBUG_PIT
+    bool "Debug PIT"
+    depends on DEBUG_PRINTS
+    default n
+    help
+      Turn on debug prints for the i8253/8254 PIT
+
+config HPET
+    bool "HPET Support"
+    depends on X86_64_HOST
+    default n
+    help
+      Includes HPET timer support in Nautilus
+
+config DEBUG_HPET
+    bool "Debug HPET"
+    depends on DEBUG_PRINTS && HPET
+    default n
+    help
+      Turn on debug prints for the HPET
+
+config HZ
+    int "Timer Interrupt Frequency"
+    range 10 10000
+    default "10"
+    help
+        Specifies the default scheduler tick 
+        frequency
+
+
+config VIRTIO_PCI
+    bool "Core Virtio PCI Driver"
+    depends on X86_64_HOST
+    default n
+    help
+      Adds the basic Virtio PCI interface
+
+config DEBUG_VIRTIO_PCI
+    bool "Debug Virtio PCI"
+    depends on DEBUG_PRINTS && VIRTIO_PCI
+    default n
+    help
+      Turn on debug prints for the Virtio 
+
+config RAMDISK
+    bool "RAM Disk Support"
+    default n
+    help 
+       Adds the ramdisk device
+
+config RAMDISK_EMBED
+    bool "Embed nautilus/ramdisk.img and instantiate at boot"
+    depends on RAMDISK
+    default n
+    help
+      Embed the ramdisk image in the main directory
+      into the Nautilus kernel image
+
+config DEBUG_RAMDISK
+    bool "Debug RAM Disk"
+    depends on DEBUG_PRINTS && RAMDISK
+    default n
+    help
+      Turn on debug prints for the ramdisk device
+
+config VESA
+    bool "VESA Support"
+    depends on REAL_MODE_INTERFACE
+    default n
+    help
+       Allow text and graphics control on VESA video cards
+
+config DEBUG_VESA
+    bool "Debug VESA"
+    depends on VESA
+    default n
+    help
+       Add debugging output from VESA driver
+
+endmenu
+
+    

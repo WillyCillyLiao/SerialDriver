@@ -1,0 +1,2 @@
+Solve MWAIT by turning off mirror serial in "menuconfig".
+Open both receiver and transmitter interrupt.

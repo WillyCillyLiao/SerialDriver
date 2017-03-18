@@ -1,0 +1,682 @@
+mainmenu "Nautilus AeroKernel Configuration"
+
+
+menu "Platform/Arch Options"
+
+    choice
+        prompt "Target Selection"
+        default X86_64_HOST
+
+        config X86_64_HOST
+            bool "x86_64 Host"
+
+        config XEON_PHI
+            bool "Intel Xeon Phi Accelerator"
+    
+        config HVM_HRT
+            bool "Hybrid Runtime AeroKernel (HRT)"
+
+    endchoice
+
+    config MAX_CPUS
+        int "Maximum Number of CPUs"
+        range 1 2048
+        default "256"
+        help 
+          Specifies the maximum number of hardware CPUs supported by Nautilus 
+          For uniprocessor environments, set this to 1
+
+    config MAX_IOAPICS
+        int "Maximum Number of IOAPICS"
+        range 1 255
+        default "16"
+        help
+          Specifies the maximum number of IOAPICS supported by Nautilus
+
+    config HRT_HIHALF_OFFSET
+        hex "HRT High-half offset"
+        default 0xffff800000000000
+        depends on HVM_HRT
+        help
+          Sets the fixed virtual-to-physical address mapping for the HRT
+
+    config HRT_GPA_MAP_REQ
+        hex "HRT Max GPA to map"
+        default 0x200000000
+        depends on HVM_HRT
+        help
+          Sets the default amount of physical memory that the VMM should
+          attempt to map for the HRT
+
+    config HRT_COMM_PAGE
+        hex "GPA of HRT/HVM communication page"
+        default 0x1fffff000
+        depends on HVM_HRT
+        help
+          Sets the default page address at which the VMM and HRT will
+          communicate information
+
+    config HVM_INT_VEC
+        int "HVM/HRT Interrupt vector"
+        default 255
+        range 33 255
+        depends on HVM_HRT
+        help
+          Sets the interrupt vector to use for communication between
+          the VMM and the HRT
+
+    choice 
+        prompt "HRT Page Size Request"
+        depends on HVM_HRT
+        default HRT_PS_2M
+        help
+            Requests a given page size to map the initial page tables 
+            from the VMM
+
+        config HRT_PS_512G
+          bool "512GB Pages"
+          
+        config HRT_PS_1G
+          bool "1GB Pages"
+
+        config HRT_PS_2M
+          bool "2MB Pages"
+
+        config HRT_PS_4K
+          bool "4KB Pages"
+
+    endchoice
+            
+        
+    config PALACIOS
+    	bool "Support for creating VMs using Palacios"
+        depends on X86_64_HOST
+        default 0
+    config PALACIOS_DIR
+        depends on PALACIOS
+        string "Path to Palacios VMM tree"
+            default "../palacios"
+            help
+              Path to the Palacios VMM build.  Palacios must be built for
+              Nautilus, and both palacios/libv3vee.a and libnautilus.a must exist
+    config PALACIOS_EMBED_VM_IMG
+    	bool "Embed VM image"
+        depends on PALACIOS
+        default 0
+    config PALACIOS_EMBEDDED_VM_IMG
+        depends on PALACIOS
+        string "Path to Palacios VM image to embed"
+            default "management_vm.img"
+            help
+              Path to the image that will be embedded
+    config PALACIOS_MGMT_VM
+    	bool "Launch embedded VM at boot as Management VM"
+        depends on PALACIOS
+        default 0
+        
+endmenu
+
+menu "Nautilus AeroKernel Build Config"
+
+    config USE_NAUT_BUILTINS
+        bool "Use GCC Built-in Utility Functions"
+        default y
+        help
+          Compiles the Nuatilus kernel with built-in functions
+          like __builtin_strcpy etc., as opposed to Nautilus
+          versions, the full set of which may not be supported
+
+    config CXX_SUPPORT
+      bool "Enable C++ support"
+      default y
+      help
+        Compiles the Nautilus kernel with C++ support. Necessary for,
+        e.g. C++ HRT integration
+
+    config TOOLCHAIN_ROOT
+      string "Toolchain Root"
+      help 
+       Directory where the intended GCC toolchain, binutils, libraries, grub, etc are installed.
+
+
+endmenu
+
+
+menu "Interface Options"
+
+config THREAD_EXIT_KEYCODE
+    int "Thread Exit Keycode"
+    range 1 255
+    default "196"
+    help
+        uses a special thread exit keycode
+
+endmenu
+
+menu "Nautilus AeroKernel Configuration"
+
+config MAX_THREADS
+    int "Maximum number of threads in system"
+    default 1024
+    help
+      Maximum number of threads in system (or any core) at once
+
+config USE_TICKETLOCKS
+    bool "Use Ticket/Bakery locks instead of default spin"
+    default n
+    help
+      Uses ticketlocks (similar to Linux impl.) instead of
+      default spinlocks
+
+config VIRTUAL_CONSOLE_SERIAL_MIRROR
+    bool "Mirror virtual console log output to serial"
+    default n
+    help
+	Writes any log output 
+        traffic to serial port in addition to its
+        target virtual console
+
+config VIRTUAL_CONSOLE_SERIAL_MIRROR_ALL
+    bool "Mirror all virtual console output to serial"
+    default n
+    depends on VIRTUAL_CONSOLE_SERIAL_MIRROR
+    help
+	Writes all printfs, logs, puts, putchars, etc
+        traffic to serial port in addition to their
+        target virtual consoles;  direct displays
+        (screen clears, display char, etc) are not
+        currently mirrored.
+
+  menu "Scheduler Options"
+
+    config UTILIZATION_LIMIT
+    int "Utilization limit (%)"
+    range 0 100
+    default 99
+    help
+       The maximum percent utilization the scheduler will allow
+       on a core.   This gives headroom for the scheduler itself.
+
+    config SPORADIC_RESERVATION
+    int "Sporadic reservation (%)"
+    range 0 100
+    default 10
+    help
+       The percentage utilization the scheduler will dedicate
+       to sporadic threads and tasks on each core.  Sporadic
+       tasks that exceed this are not admitted, even if 
+       there is time available. 
+
+    config APERIODIC_RESERVATION
+    int "Aperiodic reservation (%)"
+    range 0 100
+    default 10
+    help
+       The percentage utilization the scheduler will dedicate
+       to aperiodic threads on each core.   Aperiodic threads
+       can exceed this - they also soak up any time not being
+       used by RT threads. 
+
+    config HZ
+       int "Timer Interrupt Frequency"
+       range 10 10000
+       default "10"
+       help
+        Specifies the tick rate for timers and aperiodic
+        scheduling.  The reciprical of this number is 
+        the scheduling quantum for aperiodic (but not RT)
+        threads.
+
+    config AUTO_REAP
+       bool "Reap threads automatically"
+       default n
+       help
+        Should core zero periodically reap the global
+        thread list of dead detached threads?  Only core 0
+        does this. 
+
+    config AUTO_REAP_PERIOD_MS
+       depends on AUTO_REAP
+       int "Reaping Period (ms)"
+       range 10 10000
+       default "1000"
+       help
+        The target period between reaping the global
+        thread list of dead detached threads. 
+
+    config WORK_STEALING
+       bool "Work stealing"
+       default n
+       help
+        If enabled an idle cpu will attempt to steal
+        runnable threads from other cpus.  
+
+    config WORK_STEALING_INTERVAL_MS
+       depends on WORK_STEALING
+       int "Work stealing interval (ms)"
+       range 1 10000
+       default "10"
+       help
+        The target period between work-stealing attempts
+	by the idle thread.  This is in terms of 
+        the amount of time the idle thread itself executes
+	not the real-
+
+    config WORK_STEALING_AMOUNT
+       depends on WORK_STEALING
+       int "Work stealing amount"
+       range 1 100
+       default "4"
+       help
+        The number of threads the idle thread will
+        attempt to steal every time work stealing is
+	run.
+
+    config INTERRUPT_THREAD
+       bool "Restrict interrupts to special real-time interrupt thread"
+       default false
+       help 
+          When enabled, all interrupts, except scheduling-related
+          interrupts, are ignored except when a special, per-core
+          interrupt thread is running.  The interrupt thread is a
+          periodic real-time thread.  This forces interrupt handlers
+          to start only at well-constrained points in time.   
+          If interrupt handlers are of bounded, known duration, they 
+          also then finish before well-contrained points in time 
+          (max: end of slice + interrupt duration).   The downside
+          of this mechanism is that interrupts are delayed until 
+          the interrupt thread is run, increasing interrupt latency.
+          Note that threads can insulate themselves from interrupts
+          outside of this mechanism, using the interrupt_priority_class
+          mechanism. 
+
+    config INTERRUPT_THREAD_PERIOD_US
+       depends on INTERRUPT_THREAD
+       int "Period for the interrupt thread (us)"
+       range 500 10000
+       default 1000
+       help 
+          The interrupt thread will run this often
+
+    config INTERRUPT_THREAD_SLICE_US
+       depends on INTERRUPT_THREAD
+       int "Slice for the interrupt thread (us)"
+       range 100 5000
+       default 100
+       help 
+          The interrupt thread will execute for this long when it runs
+
+    config INTERRUPT_THREAD_ALLOW_IDLE
+       depends on INTERRUPT_THREAD
+       bool "Also allow interrupts when running idle thread"
+       default false
+       help 
+          Enable interrupts while running the idle thread
+
+    choice
+        prompt "Scheduling Model For Aperiodic Threads"
+        default APERIODIC_ROUND_ROBIN
+
+        config APERIODIC_DYNAMIC_QUANTUM
+            bool "Dynamic, Quantum-based Priority"
+            help 
+               Aperiodic threads have dynamic priority based on a 
+               fixed priority and their runtime within a scheduling quantum.  
+               Longer runtime means lower priority.
+
+        config APERIODIC_DYNAMIC_LIFETIME
+            bool "Dynamic, Lifetime-based Priority"
+            help  
+               Aperiodic threads have dynamic priority based on a 
+               fixed priority and their total runtime.  
+               Longer runtime means lower priority.
+
+        config APERIODIC_LOTTERY
+            bool "Lottery scheduling"
+            help 
+               Aperiodic threads are given a random priority based on 
+               the fixed priorities of all aperiodic threads on the core.
+ 
+        config APERIODIC_ROUND_ROBIN 
+            bool "Round-robin scheduling"
+            help 
+               Aperiodic threads are scheduled round-robbin
+      
+
+    endchoice
+  endmenu
+config REAL_MODE_INTERFACE
+   bool "Enable the Long->Real interface"
+   default n
+   help
+      Allows long mode code in Nautilus to execute real-mode
+      software interrupts (e.g., BIOS, VESA, etc)
+
+config DEBUG_REAL_MODE_INTERFACE
+   bool "Debug Long->Real interface"
+   default n
+   depends on REAL_MODE_INTERFACE
+   help
+      Adds debugging output for the long->real interface
+
+config REAL_MODE_INTERFACE_SEGMENT
+   hex "Segment (64K total) used for Long->Real interface"
+   default 0x8000
+   depends on REAL_MODE_INTERFACE
+   help
+      Segment used for the real-mode interface
+      The first 32K is reserved for the trampoline
+      code and data. The second 32K can be used by
+      code invoking real mode interrupts
+endmenu
+
+menu "AeroKernel Performance Optimizations"
+
+    config FPU_SAVE
+      bool "Save FPU state on all context switches"
+      default y
+      help
+        Compiles the kernel to save FPU state on every context switch. 
+        This is not strictly necessary if processors are not virtualized 
+        (by the HRT).
+    
+    config KICK_SCHEDULE
+        bool "Kick cores with IPIs on scheduling events"
+        default n
+        help
+          This will reduce the latency and variance of scheduling events
+          by kicking the remote CPU with an IPI, causing a scheduling event
+          to occur immediately, rather than waiting for next timer tick or
+          current thread to yield.
+
+    config HALT_WHILE_IDLE
+        bool "Halt the CPU when idle"
+        default n
+        help
+            This will cause the CPU to go into a halt in an idle thread when
+            there is nothing else important to run. Can potentially reduce
+            memory traffic do to yields(), especially on platforms like the 
+            Xeon Phi.
+
+    config THREAD_OPTIMIZE
+        bool "Optimize threading for performance"
+        default n
+        help
+            Disables paranoid condition checking and optimizes thread functions
+            for maximum performance.
+
+    config USE_IDLE_THREADS
+        bool "Start idle threads on all cores"
+        default n
+        help
+            Enables idle threads to start in addition to the main boot threads. 
+            Usually not needed.
+
+
+endmenu
+
+      
+    
+
+menu Debugging
+
+    config DEBUG_INFO
+      bool "Compile with Debug Symbols"
+      default n
+      help
+        Compiles Nautilus with GCC debugging information. This
+        is useful for remote debugging with GDB and QEMU/BOCHS.
+
+    config DEBUG_PRINTS
+  	  bool "Enable Debugging Prints"
+	  default n
+	  help
+	    Compiles the Nautilus kernel with debugging prints
+
+    config ENABLE_ASSERTS
+      bool "Enable Runtime Assertions"
+      default n
+      help
+        This will enable runtime assert statements. If this is
+        disabled, they will not be generated
+
+    config PROFILE
+      bool "Enable Profiling"
+      default n
+      help
+        Profile select function entries and exits
+
+    config SILENCE_UNDEF_ERR
+      bool "Silence Errors for Undefined Functions"
+      default n
+      help
+        Mutes error prints related to undefined 
+        libc compatibility functions. Useful when 
+        porting applications to HRT model.
+
+    config ENABLE_STACK_CHECK
+    bool "Enable Runtime Stack Overrun Checking"
+    default n
+    help
+      This checks the stack pointer on every thread switch to
+      make sure that a thread hasn't overrun its allocated 
+      stack
+
+    config DEBUG_PAGING
+      bool "Debug Paging"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debug prints for paging subsystem
+
+    config DEBUG_BOOTMEM
+      bool "Debug Bootmem Allocator"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debugging for the boot memory allocator
+
+    config DEBUG_BUDDY
+      bool "Debug Buddy Allocator"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debugging for the buddy allocator
+
+    config DEBUG_KMEM
+      bool "Debug Kernel Memory Allocator"
+      depends on DEBUG_PRINTS
+      default n
+      help
+         Turn on debugging for the high-level kernel
+         memory allocator (malloc/free)
+
+    config DEBUG_FPU
+      bool "Debug FPU"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debug prints for FPU related code (SIMD,MMX,SSE,etc.)
+
+    config DEBUG_SMP
+      bool "Debug SMP"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debug prints for SMP code
+
+    config DEBUG_HRT
+      bool "Debug HRT"
+      depends on DEBUG_PRINTS && HVM_HRT
+      default n
+      help
+        Turn on debug prints for HRT/HVM code
+
+    config DEBUG_SFI
+      bool "Debug SFI"
+      depends on DEBUG_PRINTS
+      default n
+      help 
+        Turn on debug prints for SFI platform firmware code
+
+    config DEBUG_CXX
+      bool "Debug C++"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debug prints for C++ initialization/support code
+
+    config DEBUG_THREADS
+      bool "Debug Threads"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debug prints for threads
+
+    config DEBUG_SCHED
+      bool "Debug Scheduler"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debug prints for the scheduler
+
+    config DEBUG_TIMERS
+      bool "Debug Timers"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turn on debug prints for timer subsystem
+
+    config DEBUG_SYNCH
+      bool "Debug Synchronization"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turns on debug prints for synchronization functions
+        (rwlock, condvar)
+
+    config DEBUG_BARRIER
+      bool "Debug Barriers"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turns on debug prints for barriers
+
+    config DEBUG_NUMA
+      bool "Debug NUMA code"
+      depends on DEBUG_PRINTS
+      default n
+      help
+        Turns on debug prints for NUMA code
+
+    config DEBUG_VIRTUAL_CONSOLE
+      bool "Debug Virtual Console"
+      default n
+      help
+        Turn on debug output for VC
+
+    config DEBUG_DEV
+      bool "Debug Base Device Interface"
+      default n
+      help
+        Turn on debug output for base device interface
+    config DEBUG_CHARDEV
+      bool "Debug Character Device Interface"
+      depends on DEBUG_DEV
+      default n
+      help
+        Turn on debug output for character device interface
+    config DEBUG_BLKDEV
+      bool "Debug Block Device Interface"
+      depends on DEBUG_DEV
+      default n
+      help
+        Turn on debug output for block device interface
+    config DEBUG_NETDEV
+      bool "Debug Network Device Interface"
+      depends on DEBUG_DEV
+      default n
+      help
+        Turn on debug output for network device interface
+
+config DEBUG_FILESYSTEM
+        bool "Debug Base Filesystem Interface"
+        depends on DEBUG_PRINTS
+        default n
+        help
+                Turn on debug prints for the filesystem interface
+
+endmenu
+
+
+
+menu "Parallel Runtime Integration"
+
+    choice 
+        prompt "Selection of Parallel Runtime"
+        default NO_RT
+
+        config LEGION_RT
+          bool "Legion RT"
+          depends on CXX_SUPPORT
+          
+        config LEGION_RT_ROOT
+            string "Legion RT Root"
+            depends on LEGION_RT
+            help 
+              Directory where the intended Legion runtime is installed
+
+        config LEGION_RT_DEBUG
+            bool "Legion RT Deep Debugging"
+            default n
+            depends on LEGION_RT
+            help
+              Turns on deep debugging prints for legion runtime in Nautilus
+
+        config NDPC_RT
+          bool  "NDPC RT"
+          depends on CXX_SUPPORT
+
+        config NDPC_RT_ROOT
+            string "NDPC RT Root"
+            depends on NDPC_RT
+            help 
+              Directory where the intended NDPC runtime is installed
+
+        config NDPC_RT_TEST_OBJ
+            string "NDPC RT Test Object File"
+            depends on NDPC_RT
+            help 
+              File that contains a function test_ndpc()
+
+        config NESL_RT
+          bool  "NESL RT"
+
+        config NESL_RT_ROOT
+            string "NESL RT Root"
+            depends on NESL_RT
+            help 
+              Directory where the intended NESL runtime is installed
+
+        config NESL_NDPC_RT_ROOT
+            string "NESL NDPC RT Root"
+            depends on NESL_RT
+            help 
+              Directory where the intended NDPC runtime is installed
+
+        config NO_RT
+          bool "No parallel runtime"
+          
+     endchoice
+        
+
+endmenu
+
+
+
+
+source "src/dev/Kconfig"
+
+source "src/fs/Kconfig"
+
+
